@@ -6,7 +6,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
-from augmentations import _augmentation_space
+from utils.augmentations import _augmentation_space
 
 
 def _default_aug_space() -> Dict[str, dict]:
@@ -95,8 +95,9 @@ class Config:
 
     # Training
     batch_size: int = 8
-    epochs: int = 500
+    epochs: int = 200
     seed: int = 42
+    mixed_precision: bool = True
     device: str = "cuda:0"
 
     # Optimization
@@ -107,6 +108,7 @@ class Config:
     scheduler_params: Dict[str, Union[int, float, str]] = field(
         default_factory=lambda: {"mode": "min", "factor": 0.5, "patience": 5, "min_lr": 1e-6}
     )
+    grad_clip_norm: Optional[float] = None
 
     # Model
     model_name: str = ""
@@ -119,7 +121,7 @@ class Config:
     segment_length: int = 450
     tasks: List[str] = field(default_factory=lambda: ["A"])
     note: str = ""
-    datasets_root: str = "data"
+    datasets_root: str = str(Path.cwd() / "data")
     train_datasets: List[str] = field(default_factory=list)
     test_datasets: List[str] = field(default_factory=list)
 

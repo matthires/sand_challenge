@@ -6,6 +6,7 @@ from typing import Tuple, Optional, Iterable
 import numpy as np
 import pandas as pd
 import scipy.stats
+import json
 
 from sklearn.metrics import (
     accuracy_score,
@@ -19,6 +20,59 @@ from sklearn.metrics import (
 
 
 # ---------------------------- small helpers ---------------------------- #
+
+
+def avg_f1_score_sand(y_true, y_pred):
+    classes = np.unique(np.concatenate([y_true, y_pred]))
+    scores, class_stats = [], {}
+    for c in classes:
+        tp = np.sum((y_true == c) & (y_pred == c))
+        fp = np.sum((y_true != c) & (y_pred == c))
+        fn = np.sum((y_true == c) & (y_pred != c))
+        denom = tp + 0.5 * (fp + fn)
+        score = tp / denom if denom > 0 else 0.0
+        scores.append(score)
+        class_stats[int(c)] = {"TP": int(tp), "FP": int(fp), "FN": int(fn), "score": float(score)}
+    return np.mean(scores), class_stats
+
+
+def multiclass_specificity(y_true, y_pred, average="macro"):
+    cm = confusion_matrix(y_true, y_pred)
+    num_classes = cm.shape[0]
+    specificities = []
+
+    for i in range(num_classes):
+        # TP: True positives for class i
+        # FP: False positives for class i
+        # FN: False negatives for class i
+        # TN: True negatives for class i
+
+        # For class i, treat it as the "positive" class
+        # TP_i = cm[i, i]
+        # FN_i = sum of row i, excluding cm[i,i]
+        # FP_i = sum of col i, excluding cm[i,i]
+
+        # TN_i = sum of all elements NOT in row i and NOT in col i
+
+        # Calculate TN_i
+        tn_i = cm.sum() - cm[i, :].sum() - cm[:, i].sum() + cm[i, i]
+
+        # Calculate FP_i
+        fp_i = cm[:, i].sum() - cm[i, i]
+
+        if (tn_i + fp_i) > 0:
+            specificity_i = tn_i / (tn_i + fp_i)
+        else:
+            specificity_i = 0.0  # Handle cases where there are no true negatives or false positives
+
+        specificities.append(specificity_i)
+
+    if average == "macro":
+        return np.mean(specificities)
+    elif average == "None":  # Return array of specificities per class
+        return np.array(specificities)
+    else:
+        raise ValueError("Invalid averaging method. Choose 'macro' or 'None'.")
 
 
 def round_percentage(value: float) -> float:
@@ -107,6 +161,8 @@ def calculate_metrics(
     results: pd.DataFrame,
     per_patient: bool = True,
     proba_column: Optional[str] = None,
+    num_classes: Optional[int] = None,
+    labels: Optional[Iterable[int]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Calculate metrics at the per-patient (or per-sample) level, then summarize.
@@ -114,7 +170,7 @@ def calculate_metrics(
     Parameters
     ----------
     results : pd.DataFrame
-        Must contain columns: 'subject', 'predicted', 'true'.
+        Must contain columns: 'subject', 'probs', 'true'.
         Optionally may contain a probability column (name given by `proba_column`).
         - For binary problems, if `proba_column` is provided (probability of positive class),
           AUC will be computed from probabilities; otherwise from hard labels (not ideal).
@@ -122,30 +178,61 @@ def calculate_metrics(
         If True, aggregate per subject by averaging predictions and taking the first true label.
     proba_column : str or None, optional
         Column name with predicted probabilities/scores for AUC. Only used for binary.
+    num_classes : int or None, optional (default=None)
+        Specifies the total number of classes for metric computation. When set to 2, the
+        function forces binary classification metrics (e.g., sensitivity, specificity),
+        even if only one class is present in the data slice. If None, the number of classes
+        is inferred from the data.
+    labels : Iterable[int] or None, optional (default=None)
+        Explicit list defining the class label space and ordering for metric calculation.
+        This ensures consistent confusion matrix dimensions across folds or evaluations.
+        If provided, it overrides `num_classes` for defining the label space.
 
     Returns
     -------
-    (pd.DataFrame, pd.DataFrame)
-        - first: per-patient (or per-sample) DataFrame with a 'predicted_binary' column
-        - second: one-row DataFrame with summary metrics
+    df : pd.DataFrame
+        DataFrame used for metric computation (either per-patient or per-sample),
+        containing columns: 'true', 'probs', and 'predicted_label'.
+    summary : pd.DataFrame
+        One-row DataFrame with summary metrics (accuracy, sensitivity/recall,
+        specificity for binary; macro-averaged metrics for multiclass), including
+        the confusion matrix and confidence intervals.
     """
     df = results.copy()
+    is_binary = (num_classes == 2) or (labels is not None and len(labels) == 2)
 
     if per_patient:
-        agg = {"predicted": "mean", "true": "first"}
-        if proba_column and proba_column in df.columns:
-            agg[proba_column] = "mean"
+        if is_binary:
+            # Simple scalar mean for binary (probs is a float)
+            agg = {"probs": "mean", "true": "first"}
+        else:
+            # Elementwise mean for multiclass (probs is a vector)
+            def _mean_vec(values):
+                """Mean aggregation for multiclass probability vectors."""
+                arrs = np.stack(values.to_numpy(), axis=0)  # shape (n_samples, num_classes)
+                return np.mean(arrs, axis=0)
+
+            agg = {"probs": _mean_vec, "true": "first"}
         df = df.groupby("subject", as_index=False).agg(agg)
 
-    # binarize averaged predictions
-    df["predicted_binary"] = df["predicted"].round().astype(int)
-
-    # Compute summary
     y_true = df["true"].to_numpy()
-    y_pred = df["predicted_binary"].to_numpy()
-    y_score = df[proba_column].to_numpy() if (proba_column and proba_column in df.columns) else None
 
-    summary = calculate_results(y_true, y_pred, y_score)
+    if is_binary:
+        # Binary classification -> scalar probs per row
+        df["predicted_label"] = (df["probs"] >= 0.5).astype(int)
+        y_pred = df["predicted_label"].to_numpy()
+        y_score = df["probs"].to_numpy()
+
+    else:
+        # Multiclass -> probs is array-like per row
+        probs_mat = np.stack(df["probs"].to_numpy(), axis=0)  # shape (N, C)
+        df["predicted_label"] = np.argmax(probs_mat, axis=1)
+        y_pred = df["predicted_label"].to_numpy()
+        y_score = probs_mat  # enables multiclass AUC
+
+    summary = calculate_results(y_true, y_pred, y_score=y_score, num_classes=num_classes, labels=labels)
+    if per_patient:
+        return df, summary
     return df, summary
 
 
@@ -153,6 +240,7 @@ def calculate_results(
     y_true: np.ndarray,
     y_predicted: np.ndarray,
     y_score: Optional[np.ndarray] = None,
+    num_classes: Optional[int] = None,
     labels: Optional[Iterable[int]] = None,
 ) -> pd.DataFrame:
     """
@@ -185,38 +273,68 @@ def calculate_results(
     y_true = np.asarray(y_true).astype(int)
     y_predicted = np.asarray(y_predicted).astype(int)
 
-    unique_labels = np.unique(y_true) if labels is None else np.array(list(labels))
-    cm = confusion_matrix(y_true, y_predicted, labels=unique_labels)
-
     accuracy = accuracy_score(y_true, y_predicted)
     bal_acc = balanced_accuracy_score(y_true, y_predicted)
+    f1_sand, stats = avg_f1_score_sand(y_true, y_predicted)
 
-    if unique_labels.size == 2:
-        # Binary metrics
-        # positive class assumed to be the max label
-        pos_label = unique_labels.max()
-        sensitivity = recall_score(y_true, y_predicted, pos_label=pos_label)
-        # specificity = TN / (TN + FP)
-        tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (np.nan, np.nan, np.nan, np.nan)
-        specificity = float(tn) / (tn + fp) if (tn + fp) > 0 else np.nan
+    # If nothing provided, infer from data
+    if num_classes is None and labels is None:
+        uniq = np.unique(y_true.astype(int))
+        if uniq.size <= 2:
+            num_classes = 2
+            labels = [0, 1] if set(uniq).issubset({0, 1}) else sorted(uniq.tolist())
+        else:
+            num_classes = int(uniq.size)
+            labels = sorted(uniq.tolist())
 
-        precision = precision_score(y_true, y_predicted, pos_label=pos_label, zero_division=0)
-        f1 = f1_score(y_true, y_predicted, pos_label=pos_label, zero_division=0)
+    # If labels provided without num_classes, derive it
+    if num_classes is None and labels is not None:
+        num_classes = len(list(labels))
+
+    # If num_classes provided without labels, create a default range
+    if labels is None and num_classes is not None:
+        labels = list(range(int(num_classes)))
+
+    # Final guard: both must now be concrete
+    if num_classes is None or labels is None:
+        raise ValueError("calculate_results: could not determine class space (num_classes/labels).")
+
+    # --- replace the old is_binary line with this safe check ---
+    is_binary = (int(num_classes) == 2) or (labels is not None and len(list(labels)) == 2)
+
+    cm = confusion_matrix(y_true, y_predicted, labels=labels)
+    if is_binary:
+        # Handle 2x2 CM even if one class is absent
+        if cm.shape != (2, 2):
+            # pad to 2x2 if needed
+            full = np.zeros((2, 2), dtype=int)
+            # map existing labels into {0,1} index positions
+            idx_map = {lbl: i for i, lbl in enumerate(labels)}
+            if len(labels) == 1:
+                # assume the single label corresponds to index 0
+                full[0, 0] = cm[0, 0] if cm.size else 0
+            else:
+                full[: cm.shape[0], : cm.shape[1]] = cm
+            cm = full
+
+        tn, fp, fn, tp = cm.ravel()
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+        precision = precision_score(y_true, y_predicted, pos_label=labels[-1], zero_division=0)
+        f1 = f1_score(y_true, y_predicted, pos_label=labels[-1], zero_division=0)
 
         # AUC: prefer probabilities if provided
-        if y_score is not None and y_score.ndim == 1:
+        if y_score is not None and y_score.ndim <= 1:
             try:
                 auc = roc_auc_score(y_true, y_score)
             except Exception:
                 auc = np.nan
         else:
-            # AUC from hard labels isn't ideal; keep for backward-compat
             try:
                 auc = roc_auc_score(y_true, y_predicted)
             except Exception:
                 auc = np.nan
 
-        # CI for accuracy (normal approx)
         ci_low, ci_high = proportion_confidence_interval(accuracy, len(y_true))
         conf_intervals = np.round(np.array([ci_low, ci_high]) * 100.0, 4)
 
@@ -231,43 +349,61 @@ def calculate_results(
                 "auc": [auc],
                 "conf_intervals": [np.array_str(conf_intervals)],
                 "conf_matrix": [np.array_str(cm)],
+                "f1_sand": f1_sand,
+                "f1_sand_class_stats": [json.dumps(stats)],
             }
         )
-
-        # convert fractions to percentages
-        pct_cols = ["accuracy", "balanced_accuracy", "sensitivity", "specificity", "precision", "f1", "auc"]
+        pct_cols = [
+            "accuracy",
+            "balanced_accuracy",
+            "sensitivity",
+            "specificity",
+            "precision",
+            "f1",
+            "f1_sand",
+            "f1_sand_class_stats",
+            "auc",
+        ]
         out[pct_cols] = out[pct_cols].applymap(round_percentage)
         return out
 
-    else:
-        # Multiclass (macro-averaged metrics)
-        sensitivity_macro = recall_score(y_true, y_predicted, average="macro", zero_division=0)
-        precision_macro = precision_score(y_true, y_predicted, average="macro", zero_division=0)
-        f1_macro = f1_score(y_true, y_predicted, average="macro", zero_division=0)
+    # Multiclass branch
+    sensitivity_macro = recall_score(y_true, y_predicted, average="macro", zero_division=0)
+    specificity_macro = multiclass_specificity(y_true, y_predicted, average="macro")
+    precision_macro = precision_score(y_true, y_predicted, average="macro", zero_division=0)
+    f1_macro = f1_score(y_true, y_predicted, average="macro", zero_division=0)
 
-        # Multiclass AUC (OvR) only if scores provided with proper shape
-        if y_score is not None and y_score.ndim == 2 and y_score.shape[1] >= unique_labels.size:
-            try:
-                auc_ovr = roc_auc_score(y_true, y_score, multi_class="ovr", average="macro")
-            except Exception:
-                auc_ovr = np.nan
-        else:
+    if y_score is not None and y_score.ndim == 2 and y_score.shape[1] >= len(labels):
+        try:
+            auc_ovr = roc_auc_score(y_true, y_score, multi_class="ovr", average="macro", labels=labels)
+        except Exception:
             auc_ovr = np.nan
+    else:
+        auc_ovr = np.nan
 
-        out = pd.DataFrame(
-            {
-                "accuracy": [accuracy],
-                "balanced_accuracy": [bal_acc],
-                "sensitivity_macro": [sensitivity_macro],
-                "precision_macro": [precision_macro],
-                "f1_macro": [f1_macro],
-                "specificity": [np.nan],  # not defined cleanly for multiclass
-                "auc": [auc_ovr],
-                "conf_intervals": [np.array_str(np.array([np.nan, np.nan]))],
-                "conf_matrix": [np.array_str(cm)],
-            }
-        )
-
-        pct_cols = ["accuracy", "balanced_accuracy", "sensitivity_macro", "precision_macro", "f1_macro", "auc"]
-        out[pct_cols] = out[pct_cols].applymap(round_percentage)
-        return out
+    out = pd.DataFrame(
+        {
+            "accuracy": [accuracy],
+            "balanced_accuracy": [bal_acc],
+            "sensitivity_macro": [sensitivity_macro],
+            "precision_macro": [precision_macro],
+            "f1_macro": [f1_macro],
+            "specificity": [specificity_macro],
+            "auc": [auc_ovr],
+            "conf_matrix": [np.array_str(cm)],
+            "f1_sand": f1_sand,
+            "f1_sand_class_stats": [json.dumps(stats)],
+        }
+    )
+    pct_cols = [
+        "accuracy",
+        "balanced_accuracy",
+        "sensitivity_macro",
+        "precision_macro",
+        "f1_macro",
+        "f1_sand",
+        "f1_sand_class_stats",
+        "auc",
+    ]
+    out[pct_cols] = out[pct_cols].applymap(round_percentage)
+    return out

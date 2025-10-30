@@ -14,10 +14,10 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import librosa
 import librosa.display
 
-from config import Config
-from spectrograms import create_spectrogram
-import augmentations as ta
-from audio_processing import _safe_load_wav, _resample_if_needed
+from utils.config import Config
+from utils.spectrograms import create_spectrogram
+import utils.augmentations as ta
+from utils.audio_processing import _safe_load_wav, _resample_if_needed
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

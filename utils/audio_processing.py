@@ -9,7 +9,7 @@ import torch
 import torchaudio
 from torchaudio.transforms import Resample
 
-from config import Config
+from utils.config import Config
 
 
 # ---------- Low-level audio helpers  ----------
@@ -140,59 +140,163 @@ class DataManager:
 
         return pd.DataFrame(rows)
 
-    def get_dataset_info_df(self, datasets_path: Union[str, Path]) -> pd.DataFrame:
+    def get_dataset_info_df(
+        self, path: Union[str, Path], dataset_label: str | None = None, metadata_path: Union[str, Path] | None = None
+    ) -> pd.DataFrame:
         """
-        Enumerate a directory-of-datasets into a DataFrame.
+        Build a DataFrame of audio files.
 
-        Expected structure:
-            <datasets_path>/<dataset>/<task>/<label>/<subject_name>/<file.wav>
+        Supports two modes:
+        1) Multi-dataset root: pass a directory that contains dataset folders.
+            (dataset_label must be None) → scans each dataset subfolder.
+        2) Single dataset dir: pass a specific dataset directory and provide dataset_label.
+
+        Expected single-dataset structure (case-insensitive for .wav):
+            <dataset_dir>/<task>/<label>/<subject>/<file.wav>
+        OR, if dataset_label is "sand":
+            <dataset_dir>/<training>/<task>/<subject_ID>_<task>.wav
+
+        Metadata file (e.g., metadata.xlsx) is expected to contain 'ID' and 'Class' columns.
+        The 'ID' from metadata will be matched with the 'ID' extracted from audio filenames.
 
         Parameters
         ----------
-        datasets_path : str or Path
+        path : Union[str, Path]
+            The base directory containing either dataset folders or a single dataset.
+            If metadata_path is provided and it's relative, 'path' is used as its anchor.
+        dataset_label : str | None, optional
+            A label for the dataset, used for single dataset scanning. If "sand",
+            the new file structure is assumed. Defaults to None.
+        metadata_path : Union[str, Path] | None, optional
+            Path to an .xlsx metadata file containing 'ID', 'Age', 'Sex', 'Class'.
+            If None, no metadata merging occurs. Defaults to None.
 
         Returns
         -------
-        pd.DataFrame
-            Columns: file_path, dataset_label, task, subject, label
+        pd.DataFrame with columns:
+        - file_path (str)
+        - dataset_label (str)
+        - task (str)
+        - subject (str)
+        - label (str)
         """
-        datasets_path = Path(datasets_path)
-        data = []
+        path = Path(path)
 
-        for dataset_dir in sorted(datasets_path.iterdir()):
-            if not dataset_dir.is_dir():
-                continue
-            dataset = dataset_dir.name
+        # scanning logic for the default structure
+        def _scan_single_dataset_original(ds_dir: Path, ds_label: str) -> list[dict]:
+            rows: list[dict] = []
+            for root, _, files in os.walk(ds_dir):
+                root_path = Path(root)
+                rel = root_path.relative_to(ds_dir)
+                parts = list(rel.parts)
 
-            for task_dir in sorted(dataset_dir.iterdir()):
-                if not task_dir.is_dir():
+                # Need at least: task / label / subject
+                if len(parts) < 3:
                     continue
-                task = task_dir.name
 
-                for label_dir in sorted(task_dir.iterdir()):
-                    if not label_dir.is_dir():
-                        continue
-                    label = label_dir.name
+                task = parts[0]
+                cls_label = parts[1]
+                subject = f"{cls_label}{parts[2]}"
 
-                    for subject_dir in sorted(label_dir.iterdir()):
-                        if not subject_dir.is_dir():
-                            continue
-                        subject = subject_dir.name
+                for f in files:
+                    if f.lower().endswith(".wav"):
+                        rows.append(
+                            {
+                                "file_path": str(root_path / f),
+                                "dataset_label": ds_label,
+                                "task": task,
+                                "subject": subject,
+                                "label": cls_label,
+                            }
+                        )
+            return rows
 
-                        for f in sorted(subject_dir.iterdir()):
-                            if f.suffix.lower() != ".wav":
-                                continue
-                            data.append(
-                                {
-                                    "file_path": str(f),
-                                    "dataset_label": dataset,
-                                    "task": task,
-                                    "subject": subject,
-                                    "label": label,
-                                }
-                            )
+        # scanning logic for the "sand" dataset_label structure
+        def _scan_sand_dataset(ds_dir: Path, ds_label: str) -> list[dict]:
+            rows: list[dict] = []
+            for root, _, files in os.walk(ds_dir):
+                root_path = Path(root)
+                rel = root_path.relative_to(ds_dir)
+                parts = list(rel.parts)
 
-        return pd.DataFrame(data)
+                if not parts:  # If it's the root directory itself, skip
+                    continue
+
+                task = parts[0]
+
+                for f in files:
+                    if f.lower().endswith(".wav"):
+                        file_name_without_ext = Path(f).stem
+                        subject_match = file_name_without_ext.split("_")[0]
+                        subject = subject_match if subject_match.startswith("ID") else "unknown"
+
+                        cls_label = task  # For "XY", task is also the label
+
+                        rows.append(
+                            {
+                                "file_path": str(root_path / f),
+                                "dataset_label": ds_label,
+                                "task": task,
+                                "subject": subject,
+                                "label": cls_label,
+                                "file_id": subject_match,  # Use subject_match as the file_id for merging
+                            }
+                        )
+            return rows
+
+        # Mode 1: multi-dataset root (no dataset_label provided)
+        all_rows: list[dict] = []
+        if dataset_label is None:
+            for ds_dir in sorted(p for p in path.iterdir() if p.is_dir()):
+                # For multi-dataset, we assume the original structure as there's no "XY" flag per sub-dataset
+                rows = _scan_single_dataset_original(ds_dir, ds_dir.name)
+                all_rows.extend(rows)
+            return pd.DataFrame(all_rows)
+        # Mode 2: single dataset dir
+        else:
+            if dataset_label == "sand":
+                training_dir = path / "training"
+                rows = _scan_sand_dataset(training_dir, dataset_label)
+            else:
+                rows = _scan_single_dataset_original(path, dataset_label)
+            all_rows.extend(rows)
+
+        df = pd.DataFrame(all_rows)
+
+        # --- Metadata Merging Logic ---
+        if metadata_path:
+            # Resolve metadata_path relative to 'path' if it's not absolute
+            resolved_metadata_path = Path(metadata_path)
+            if not resolved_metadata_path.is_absolute():
+                resolved_metadata_path = path / resolved_metadata_path
+
+            if not resolved_metadata_path.exists():
+                raise FileNotFoundError(f"Metadata file not found at: {resolved_metadata_path}")
+            if not resolved_metadata_path.suffix.lower() == ".xlsx":
+                raise ValueError("Metadata file must be an .xlsx Excel file.")
+
+            metadata_df = pd.read_excel(resolved_metadata_path)
+
+            # Ensure 'ID' and 'Class' columns exist in metadata
+            required_meta_cols = ["ID", "Class"]
+            if not all(col in metadata_df.columns for col in required_meta_cols):
+                raise ValueError(f"Metadata file must contain '{required_meta_cols}' columns.")
+
+            # Make sure ID in metadata is string type for consistent merging
+            metadata_df["ID"] = metadata_df["ID"].astype(str)
+            df["file_id"] = df["file_id"].astype(str)
+
+            # Merge the dataframes
+            # Use 'file_id' from audio df and 'ID' from metadata df for merging
+            df = pd.merge(df, metadata_df, left_on="file_id", right_on="ID", how="left", suffixes=("_audio", "_meta"))
+
+            # Update the 'label' column with 'Class' from metadata
+            df["label"] = df["Class"]
+
+            # Drop temporary and redundant columns
+            df = df.drop(columns=["file_id", "ID_meta", "label_audio", "Class"], errors="ignore")
+
+        return df
 
     def filter_dataset(self, df: pd.DataFrame, dataset_labels: List[str], tasks: List[str]) -> pd.DataFrame:
         """

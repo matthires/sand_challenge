@@ -16,10 +16,12 @@ from sklearn.model_selection import StratifiedGroupKFold
 from utils.config import Config
 from utils.metrics import calculate_metrics, calculate_results
 from utils.io import create_dir_if_not_exist, write_results_to_csv
-from models import Xception
+from models.xception import Xception
 from utils.callbacks import EarlyStopper  # your cleaned version
 from utils.audio_processing import DataManager  # for dataframe prep (not used here, but kept for symmetry)
 from utils.dataset import build_data_loader  # for dataloaders
+from sklearn.preprocessing import LabelEncoder
+from scipy.special import softmax
 
 # ----------------------------- Helpers ----------------------------- #
 
@@ -77,19 +79,42 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: Config):
 
 
 def build_criterion(cfg: Config) -> nn.Module:
-    if cfg.loss == "bce_logits":
-        # Binary: BCEWithLogitsLoss is the numerically-stable choice
+    """
+    Build the appropriate loss function based on model output and config.
+
+    Parameters
+    ----------
+    cfg : Config
+        Configuration object. Must include `num_classes` and optionally `loss`.
+
+    Returns
+    -------
+    torch.nn.Module
+        The loss function instance.
+    """
+    # Auto-select loss
+    if cfg.num_classes <= 2:
+        cfg.loss = "bce_logits"
+    elif cfg.num_classes > 2:
+        cfg.loss = "cross_entropy"
+    else:
+        # 2 logits binary (rare case)
+        cfg.loss = "cross_entropy"
+
+    # Build loss according to cfg.loss
+    if cfg.loss.lower() in {"bce", "bce_logits", "binary_cross_entropy_with_logits"}:
         if cfg.class_weights is not None:
             if len(cfg.class_weights) == 1:
                 pos_w = torch.tensor([cfg.class_weights[0]], dtype=torch.float32)
                 return nn.BCEWithLogitsLoss(pos_weight=pos_w)
         return nn.BCEWithLogitsLoss()
-    if cfg.loss == "cross_entropy":
+    elif cfg.loss.lower() in {"ce", "cross_entropy"}:
         weight = None
         if cfg.class_weights is not None and len(cfg.class_weights) == cfg.num_classes:
             weight = torch.tensor(cfg.class_weights, dtype=torch.float32)
         return nn.CrossEntropyLoss(weight=weight)
-    raise ValueError(f"Unsupported loss: {cfg.loss}")
+    else:
+        raise ValueError(f"Unsupported loss: {cfg.loss}")
 
 
 def logits_to_preds(logits: torch.Tensor, cfg: Config) -> np.ndarray:
@@ -144,6 +169,7 @@ class NeuralNetworkModel:
         self.final_results = pd.DataFrame()
         self.final_results_per_patient = pd.DataFrame()
         self.final_predictions = pd.DataFrame()
+        self.final_predictions_per_patient = pd.DataFrame()
 
         # runtime
         self.device = resolve_device(self.cfg.device)
@@ -164,14 +190,18 @@ class NeuralNetworkModel:
             Save best checkpoint per fold as `model_fold{idx}.pt`. Default False.
         """
         create_dir_if_not_exist(Path(run_dir))
-        # persist config
         self.cfg.validate()
-        self.cfg.save(run_dir)
 
-        # folds
         X = np.arange(len(self.df))
         y = self.df["label"].to_numpy()
+        label_encoder = LabelEncoder()
+        y = label_encoder.fit_transform(y)
         groups = self.df["subject"].astype(str).to_numpy()
+
+        self.cfg.label_encoder_classes = list(
+            map(lambda x: int(x) if str(x).isdigit() else str(x), label_encoder.classes_.tolist())
+        )
+        self.cfg.save(run_dir)
 
         skf = StratifiedGroupKFold(n_splits=self.cfg.k, shuffle=True, random_state=self.cfg.seed)
 
@@ -196,6 +226,12 @@ class NeuralNetworkModel:
             best_state_dict: Optional[Dict[str, torch.Tensor]] = None
             best_epoch = -1
 
+            best_val_true = None
+            best_val_subjects = None
+            best_val_logits = None
+            best_val_probs = None  # for binary
+            best_val_preds_hard = None
+
             for epoch in range(1, self.cfg.epochs + 1):
                 train_loss = self._train_one_epoch(model, train_loader, optimizer, criterion, scaler)
                 val_loss, val_pred_np, val_true_np, val_subjects = self._validate_one_epoch(
@@ -210,28 +246,65 @@ class NeuralNetworkModel:
 
                 # metrics
                 val_preds_hard = logits_to_preds(torch.from_numpy(val_pred_np), self.cfg)
-                val_df_metrics = self._compute_fold_metrics(val_true_np, val_preds_hard, val_loss)
-
-                print(
-                    f"Epoch {epoch}/{self.cfg.epochs} "
-                    f"| train_loss: {train_loss:.6f} "
-                    f"| val_loss: {val_loss:.6f} "
-                    f"| acc: {val_df_metrics['accuracy'].item():.4f} "
-                    f"| sens: {val_df_metrics['sensitivity'].item():.4f} "
-                    f"| spec: {val_df_metrics['specificity'].item():.4f} "
-                    f"| auc: {val_df_metrics['auc'].item():.4f}"
+                # For binary single-logit (cfg.num_classes == 1), use sigmoid probs; else no score.
+                val_probs_flat = (
+                    torch.sigmoid(torch.from_numpy(val_pred_np)).cpu().numpy().reshape(-1)
+                    if self.cfg.num_classes <= 2
+                    else softmax(val_pred_np, axis=1)
                 )
+                if not (val_probs_flat.ndim == 2 and val_probs_flat.shape[1] == self.cfg.num_classes):
+                    print("Warning: Softmax output shape mismatch for y_score.")
+                    val_probs_for_auc = None
+
+                val_df_metrics = self._compute_fold_metrics(
+                    y_true=val_true_np,
+                    y_pred_hard=val_preds_hard,
+                    y_score=val_probs_flat,  # None for multiclass unless softmax scores are passed
+                    val_loss=val_loss,
+                )
+
+                if self.cfg.num_classes == 1:
+                    print(
+                        f"Epoch {epoch}/{self.cfg.epochs} "
+                        f"| train_loss: {train_loss:.6f} "
+                        f"| val_loss: {val_loss:.6f} "
+                        f"| acc: {val_df_metrics['accuracy'].item():.4f} "
+                        f"| sens: {val_df_metrics['sensitivity'].item():.4f} "
+                        f"| spec: {val_df_metrics['specificity'].item():.4f} "
+                        f"| auc: {val_df_metrics['auc'].item():.4f}"
+                    )
+                else:
+                    print(
+                        f"Epoch {epoch}/{self.cfg.epochs} "
+                        f"| train_loss: {train_loss:.6f} "
+                        f"| val_loss: {val_loss:.6f} "
+                        f"| acc: {val_df_metrics['accuracy'].item():.4f} "
+                        f"| bal_acc: {val_df_metrics['balanced_accuracy'].item():.4f} "
+                        f"| f1_macro: {val_df_metrics['f1_macro'].item():.4f} "
+                        f"| auc: {val_df_metrics['auc'].item():.4f}"
+                    )
 
                 # early stopping: store the best snapshot
                 should_stop = early_stopping.early_stop(
                     {"loss": torch.tensor(val_loss, dtype=torch.float32), **val_df_metrics.to_dict("records")[0]},
                     model.state_dict(),
                 )
-                if not best_val_results or val_loss < best_val_results["loss"].iloc[0]:
+                if best_val_results is None or val_loss < best_val_results["loss"].iloc[0]:
                     best_val_results = val_df_metrics.copy()
-                    best_val_results.loc[:, "loss"] = val_loss
+                    best_val_results.loc[:, "loss"] = float(val_loss)
                     best_state_dict = model.state_dict()
                     best_epoch = epoch
+
+                    # cache arrays from the best epoch
+                    best_val_true = val_true_np.copy()
+                    best_val_subjects = list(val_subjects)
+                    best_val_logits = val_pred_np.copy()
+                    best_val_preds_hard = val_preds_hard.copy()
+                    best_val_probs = (
+                        torch.sigmoid(torch.from_numpy(best_val_logits)).cpu().numpy().reshape(-1)
+                        if self.cfg.num_classes == 1
+                        else None
+                    )
 
                 if should_stop or epoch == self.cfg.epochs:
                     print(f"Early stopping at epoch {epoch} (best epoch: {best_epoch}).")
@@ -240,20 +313,58 @@ class NeuralNetworkModel:
                         model.load_state_dict(best_state_dict)
                     break
 
-            # per-sample predictions DF (from last validation forward pass variables)
-            preds_df = pd.DataFrame(
-                {
-                    "subject": val_subjects,
-                    "predicted": logits_to_preds(torch.from_numpy(val_pred_np), self.cfg),
-                    "true": val_true_np.astype(int),
-                }
-            )
+            if best_val_true is None:
+                raise RuntimeError("No best validation snapshot cached — check loaders/early stopping logic.")
 
-            # per-patient metrics
-            _, results_per_patient = calculate_metrics(preds_df)
+            if self.cfg.num_classes == 1:
+                # Binary
+                preds_df = pd.DataFrame(
+                    {
+                        "subject": best_val_subjects,
+                        "true": best_val_true.astype(int),
+                        "probs": best_val_probs.astype(float),
+                        "predicted_label": (best_val_probs > 0.5).astype(int),
+                    }
+                )
+
+                preds_pp_df, results_per_patient = calculate_metrics(
+                    preds_df,
+                    per_patient=True,
+                    proba_column=("probs" if "probs" in preds_df.columns else None),  # use probs for AUC
+                    num_classes=2,
+                    labels=[0, 1],
+                )
+            else:
+                # Multiclass
+                logits_t = torch.from_numpy(best_val_logits).float()  # [N,C]
+                softmax_probs = torch.softmax(logits_t, dim=1).cpu().numpy()  # [N,C]
+                pred_labels = np.argmax(softmax_probs, axis=1)
+
+                preds_df = pd.DataFrame(
+                    {
+                        "subject": best_val_subjects,
+                        "true": best_val_true.astype(int),
+                        "probs": list(softmax_probs),
+                        "predicted_label": pred_labels.astype(int),
+                    }
+                )
+
+                preds_pp_df, results_per_patient = calculate_metrics(
+                    preds_df,
+                    per_patient=True,
+                    proba_column=("probs" if "probs" in preds_df.columns else None),
+                    num_classes=self.cfg.num_classes,
+                    labels=list(range(self.cfg.num_classes)),
+                )
 
             # accumulate fold results
-            self.update_final_results(best_val_results, results_per_patient, preds_df, fold_idx - 1)
+            self.update_final_results(
+                results_per_fold=best_val_results,
+                results_pp_per_fold=results_per_patient,
+                predictions_per_fold=preds_df,
+                predictions_pp_per_fold=preds_pp_df,
+                k_index=fold_idx - 1,
+            )
 
             # save best model per fold
             if save_models and best_state_dict is not None:
@@ -264,6 +375,7 @@ class NeuralNetworkModel:
             write_results_to_csv(self.final_results, "val_results", run_dir)
             write_results_to_csv(self.final_results_per_patient, "val_results_per_pat", run_dir)
             write_results_to_csv(self.final_predictions, "predictions", run_dir)
+            write_results_to_csv(self.final_predictions_per_patient, "predictions_per_pat", run_dir)
 
         # Optional: evaluate on external test sets (dict of dataframes)
         if self.test_frames:
@@ -303,7 +415,7 @@ class NeuralNetworkModel:
 
             with autocast(enabled=self.cfg.mixed_precision):
                 outputs = model(inputs)
-                if self.cfg.num_classes == 1 and self.cfg.loss == "bce_logits":
+                if self.cfg.num_classes <= 2 and self.cfg.loss == "bce_logits":
                     loss = criterion(outputs.view(-1), targets.float())
                 elif self.cfg.loss == "cross_entropy":
                     loss = criterion(outputs, targets.long())
@@ -368,43 +480,30 @@ class NeuralNetworkModel:
 
         return avg_loss, logits_np, targets_np, all_subjects
 
-    def _compute_fold_metrics(self, y_true: np.ndarray, y_pred_hard: np.ndarray, val_loss: float) -> pd.DataFrame:
+    def _compute_fold_metrics(
+        self, y_true: np.ndarray, y_pred_hard: np.ndarray, y_score: np.ndarray, val_loss: float
+    ) -> pd.DataFrame:
         """
         Wrap your `calculate_results` and add the loss as a column.
         """
-        res = calculate_results(y_true, y_pred_hard)  # your helper → DataFrame (one row)
-        res = res.assign(loss=val_loss)
-        return res
+        num_classes_for_metrics = 2 if self.cfg.num_classes == 1 else self.cfg.num_classes
+        labels_for_metrics = [0, 1] if num_classes_for_metrics == 2 else list(range(num_classes_for_metrics))
+
+        res = calculate_results(
+            y_true=y_true,
+            y_predicted=y_pred_hard,
+            y_score=y_score,  # probs for binary; None for multiclass
+            num_classes=num_classes_for_metrics,
+            labels=labels_for_metrics,
+        )
+        return res.assign(loss=float(val_loss))
 
     def _test_all(self, run_dir: Path) -> None:
         """
         Evaluate best model (from last fold) on each provided external test dataframe.
-        If you want per-fold test with each fold's best model, we can loop and average.
+        TBD
         """
-        # simple approach: rebuild model and load the last fold best (if saved), else current weights
-        # Here we just build fresh and train-once weights are already in memory from the last fold restoration.
-
-        # Build one test loader per dataset_label and evaluate
-        results_by_dataset: Dict[str, pd.DataFrame] = {}
-
-        # For test we need a trained model; after last fold, best state is loaded in `model`,
-        # but that instance is local. Simpler approach: do per-dataset test inside training loop when early-stop triggers.
-        # Below is a standalone re-eval with the last best if you saved it; otherwise skip.
-
-        # If you saved fold checkpoints, you can load the *best* overall. For now, we compute using the final model from training loop.
-        # To make this precise, consider tracking `global_best_state_dict` and reload here.
-
-        for dataset_label, test_df in self.test_frames.items():
-            test_loader = build_data_loader(test_df, self.cfg, train=False)
-
-            model = self._build_model().to(self.device)
-            # NOTE: Load a checkpoint if you saved one; otherwise this is an untrained model.
-            # You likely want to move per-dataset testing into the training fold loop after early stopping,
-            # as your original code did. That design is better and already implemented in your earlier version.
-
-            # We’ll skip evaluation here to avoid reporting untrained results.
-            # Implementing per-fold testing during training is the preferred pattern (already in your original code path).
-            pass  # intentionally no-op
+        pass
 
     # ---------------- results aggregation ---------------- #
 
@@ -414,26 +513,70 @@ class NeuralNetworkModel:
         results_pp_per_fold: pd.DataFrame,
         predictions_per_fold: pd.DataFrame,
         k_index: int,
+        predictions_pp_per_fold: Optional[pd.DataFrame] = None,
     ) -> None:
         """
-        Aggregate fold results and compute "mean" row at the end.
+        Aggregate fold results and compute 'mean' rows at the end.
 
         Parameters
         ----------
         results_per_fold : pd.DataFrame
+            Metrics per fold (per-sample level).
         results_pp_per_fold : pd.DataFrame
+            Metrics per patient per fold.
         predictions_per_fold : pd.DataFrame
+            Predictions (per-sample) for this fold.
         k_index : int
+            Fold index (0-based).
+        predictions_pp_per_fold : pd.DataFrame, optional
+            Aggregated per-patient predictions for this fold (already averaged by calculate_metrics).
+            Must contain columns: 'subject', 'true', 'probs' (and ideally 'predicted_label').
+
         """
+        # --- Add fold id to predictions
+        predictions_per_fold = predictions_per_fold.copy()
+        predictions_per_fold["fold"] = k_index + 1
+
+        # reorder columns if they exist
+        cols = ["fold", "subject", "probs", "predicted_label", "true"]
+        preds_per_patient = predictions_pp_per_fold.copy()
+        predictions_per_fold = predictions_per_fold[[c for c in cols if c in predictions_per_fold.columns]]
+        preds_per_patient = preds_per_patient[[c for c in cols if c in preds_per_patient.columns]]
+
+        # ----- accumulate
         self.final_results = pd.concat([self.final_results, results_per_fold], ignore_index=True)
         self.final_results_per_patient = pd.concat(
             [self.final_results_per_patient, results_pp_per_fold], ignore_index=True
         )
         self.final_predictions = pd.concat([self.final_predictions, predictions_per_fold], ignore_index=True)
 
-        # At the very end, compute the "mean" rows
+        if not hasattr(self, "final_predictions_per_patient"):
+            self.final_predictions_per_patient = preds_per_patient.copy()
+        else:
+            self.final_predictions_per_patient = pd.concat(
+                [self.final_predictions_per_patient, preds_per_patient], ignore_index=True
+            )
+
+        # ----- compute 'mean' rows at the very end
         if (k_index + 1) == self.cfg.k:
-            _, mean_results = calculate_metrics(self.final_predictions, per_patient=False)
-            _, mean_results_per_pat = calculate_metrics(self.final_predictions)
+            num_classes_metrics = 2 if self.cfg.num_classes == 1 else self.cfg.num_classes
+            labels_metrics = [0, 1] if num_classes_metrics == 2 else list(range(num_classes_metrics))
+
+            # per-sample is already per-sample → per_patient=False
+            _, mean_results = calculate_metrics(
+                self.final_predictions,
+                per_patient=False,
+                num_classes=num_classes_metrics,
+                labels=labels_metrics,
+            )
+
+            # per-patient predictions DF is already aggregated → per_patient=False here
+            _, mean_results_per_pat = calculate_metrics(
+                self.final_predictions_per_patient,
+                per_patient=False,
+                num_classes=num_classes_metrics,
+                labels=labels_metrics,
+            )
+
             self.final_results.loc["mean"] = mean_results.iloc[0]
             self.final_results_per_patient.loc["mean"] = mean_results_per_pat.iloc[0]
